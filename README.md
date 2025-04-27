@@ -14,7 +14,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/tecentMailCleaner.git
+git clone https://github.com/7Sageer/tecentMailCleaner.git
 cd tecentMailCleaner
 
 # 安装依赖
