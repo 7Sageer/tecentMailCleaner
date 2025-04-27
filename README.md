@@ -24,8 +24,6 @@ pip install -r requirements.txt
 ## 使用方法
 
 ```bash
-python imap_mail_cleaner.py --server imap.example.com --username your_email@example.com --days 30 
---folder "收件箱" --dry-run
 python imap_mail_cleaner.py --server imap.exmail.qq.com --username yourmail@mail.sustech.edu.cn --time-range "2025-04-27 10:00" "2025-04-27 23:30" --password 123456--dry-run
 ```
 
