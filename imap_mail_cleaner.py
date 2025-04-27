@@ -7,6 +7,30 @@ IMAP Mail Cleaner
 This script connects to an IMAP mail server and deletes emails older than a specified date.
 It can be configured to target specific folders and has safety features to prevent accidental deletion.
 It can also delete emails within a specific time range (down to the minute).
+
+Features:
+- Delete emails older than X days
+- Delete emails within a specific date and time range
+- Clean multiple folders in one operation
+- Dry-run mode to simulate deletion without actually deleting
+- Support for SSL/TLS connections
+- Detailed logging of actions
+
+Examples:
+    # List available folders
+    python imap_mail_cleaner.py --server imap.example.com --username user@example.com --list-folders
+    
+    # Delete emails older than 90 days (dry run)
+    python imap_mail_cleaner.py --server imap.example.com --username user@example.com --days 90 --dry-run
+    
+    # Delete emails in a specific time range
+    python imap_mail_cleaner.py --server imap.example.com --username user@example.com --time-range "2023-01-01" "2023-01-31" --folder "Archive"
+    
+    # Delete emails in a specific time range with specific time (not just date)
+    python imap_mail_cleaner.py --server imap.example.com --username user@example.com --time-range "2023-01-01 08:00" "2023-01-01 17:00" --folder "INBOX"
+    
+    # Clean multiple folders at once
+    python imap_mail_cleaner.py --server imap.example.com --username user@example.com --days 60 --folders "INBOX" "Sent" "Archive"
 """
 
 import imaplib
@@ -198,21 +222,37 @@ class IMAPMailCleaner:
         try:
             # Format dates for IMAP search
             start_date = start_time.strftime("%d-%b-%Y")
-            end_date = end_time.strftime("%d-%b-%Y")
             
-            # Search for messages in the date range
-            status, data = self.conn.search(None, f'SINCE {start_date} BEFORE {end_date}')
+            # Add one day to end_time to include the last day's emails
+            # IMAP's BEFORE is exclusive (strictly less than), not inclusive
+            next_day = (end_time + datetime.timedelta(days=1)).strftime("%d-%b-%Y")
+            
+            # Log the exact search query for debugging
+            search_query = f'SINCE {start_date} BEFORE {next_day}'
+            logger.info(f"IMAP search query: {search_query}")
+            
+            # Search for messages in the date range - SINCE is inclusive, BEFORE is exclusive
+            status, data = self.conn.search(None, search_query)
             
             if status != 'OK':
                 logger.error(f"Failed to search for messages in time range: {status}")
                 return []
             
+            # Check if data is empty
+            if not data or not data[0]:
+                logger.info("IMAP search returned no data")
+                return []
+            
             # Get the list of message IDs
             message_ids = data[0].split()
             message_ids = [msg_id.decode('utf-8') for msg_id in message_ids]
+            logger.info(f"IMAP search found {len(message_ids)} messages on the given dates")
             
             # Further filter by time (IMAP SEARCH doesn't support time, only dates)
             filtered_ids = []
+            time_filtered_count = 0
+            parsing_errors = 0
+            
             for msg_id in message_ids:
                 subject, sender, date_str = self.get_message_info(msg_id)
                 
@@ -224,9 +264,18 @@ class IMAPMailCleaner:
                     # Check if it's within our time range
                     if start_time <= parsed_date <= end_time:
                         filtered_ids.append(msg_id)
+                    else:
+                        time_filtered_count += 1
+                        if len(filtered_ids) < 5:  # Log a few examples of excluded messages
+                            logger.debug(f"Message outside time range: ID: {msg_id}, Date: {date_str}, Parsed: {parsed_date}")
                 except (TypeError, ValueError) as e:
+                    parsing_errors += 1
                     logger.warning(f"Could not parse date '{date_str}' for message ID {msg_id}: {e}")
                     continue
+            
+            # Log summary of filtering
+            logger.info(f"Time filtering: {len(filtered_ids)} messages within time range, "
+                        f"{time_filtered_count} outside range, {parsing_errors} date parsing errors")
             
             return filtered_ids
         except Exception as e:
@@ -322,7 +371,9 @@ def parse_arguments():
     parser.add_argument('--password', help='Email account password (will prompt if not provided)')
     parser.add_argument('--no-ssl', action='store_true', help='Disable SSL connection')
     
-    parser.add_argument('--folder', default='INBOX', help='Folder to clean (default: INBOX)')
+    folder_group = parser.add_mutually_exclusive_group()
+    folder_group.add_argument('--folder', default='INBOX', help='Folder to clean (default: INBOX)')
+    folder_group.add_argument('--folders', nargs='+', help='Multiple folders to clean')
     parser.add_argument('--list-folders', action='store_true', help='List available folders and exit')
     
     # Time range options
@@ -344,7 +395,7 @@ def parse_time_str(time_str: str) -> datetime.datetime:
         time_str: Time string in format 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'
         
     Returns:
-        datetime.datetime: Parsed datetime object
+        datetime.datetime: Parsed datetime object with timezone information (UTC)
         
     Raises:
         ValueError: If the time string format is invalid
@@ -352,10 +403,15 @@ def parse_time_str(time_str: str) -> datetime.datetime:
     # Try to parse with time
     try:
         if ' ' in time_str:
-            return datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M')
+            dt = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M')
         else:
             # If only date is provided, set time to 00:00
-            return datetime.datetime.strptime(time_str, '%Y-%m-%d')
+            dt = datetime.datetime.strptime(time_str, '%Y-%m-%d')
+        
+        # email.utils.parsedate_to_datetime returns timezone-aware datetime objects
+        # We need to make our datetime timezone-aware too for proper comparison
+        # Make it aware as UTC (since email dates are typically in UTC or will be normalized)
+        return dt.replace(tzinfo=datetime.timezone.utc)
     except ValueError:
         raise ValueError(f"Invalid time format: {time_str}. Expected format: 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'")
 
@@ -363,6 +419,17 @@ def parse_time_str(time_str: str) -> datetime.datetime:
 def main():
     """Main function to run the script."""
     args = parse_arguments()
+    
+    logger.info(f"Starting IMAP Mail Cleaner")
+    logger.info(f"Server: {args.server}, Port: {args.port}, Username: {args.username}")
+    
+    # Determine which folders to process
+    if args.folders:
+        folders_to_process = args.folders
+        logger.info(f"Target folders: {', '.join(folders_to_process)}")
+    else:
+        folders_to_process = [args.folder]
+        logger.info(f"Target folder: {args.folder}")
     
     # Prompt for password if not provided
     password = args.password
@@ -380,27 +447,29 @@ def main():
     
     # Connect to the server
     if not cleaner.connect():
+        logger.error("Failed to connect. Exiting.")
         sys.exit(1)
     
     try:
         # List folders if requested
         if args.list_folders:
+            logger.info("Retrieving folder list...")
             folders = cleaner.list_folders()
             if folders:
-                logger.info("Available folders:")
+                logger.info(f"Found {len(folders)} folders:")
                 for folder in folders:
                     print(f"  - {folder}")
             else:
                 logger.warning("No folders found or unable to list folders")
             return
         
-        # Select the folder
-        message_count = cleaner.select_folder(args.folder)
-        if message_count < 0:
-            logger.error(f"Failed to select folder: {args.folder}")
-            return
+        # Log the operation mode
+        if args.dry_run:
+            logger.info("Running in DRY-RUN mode (no emails will be deleted)")
+        else:
+            logger.warning("Running in DELETION mode - emails will be permanently deleted!")
         
-        # Determine which search method to use based on arguments
+        # Prepare time-related parameters for searches
         if args.time_range:
             try:
                 start_time = parse_time_str(args.time_range[0])
@@ -411,33 +480,59 @@ def main():
                     logger.error("Start time must be before end time")
                     return
                 
+                logger.info(f"Search mode: TIME RANGE")
                 logger.info(f"Searching for emails between {start_time} and {end_time}")
-                messages = cleaner.search_messages_in_timerange(start_time, end_time)
-                logger.info(f"Found {len(messages)} messages in the specified time range")
             except ValueError as e:
                 logger.error(f"Error parsing time range: {e}")
                 return
         else:
-            # Use the default days-based search
-            messages = cleaner.search_old_messages(args.days)
-            logger.info(f"Found {len(messages)} messages older than {args.days} days")
+            logger.info(f"Search mode: OLDER THAN {args.days} DAYS")
         
-        # Delete found messages
-        if messages:
-            deleted = cleaner.delete_messages(messages, dry_run=args.dry_run)
-            if args.dry_run:
-                logger.info(f"Dry run: Would have deleted {deleted} messages")
-            else:
-                logger.info(f"Successfully deleted {deleted} messages")
-        else:
+        # Process each folder
+        total_deleted = 0
+        for folder in folders_to_process:
+            logger.info(f"\nProcessing folder: {folder}")
+            
+            # Select the folder
+            message_count = cleaner.select_folder(folder)
+            if message_count < 0:
+                logger.error(f"Failed to select folder: {folder}, skipping")
+                continue
+            
+            # Search for messages based on criteria
             if args.time_range:
-                logger.info(f"No messages found in the specified time range in {args.folder}")
+                messages = cleaner.search_messages_in_timerange(start_time, end_time)
+                logger.info(f"Found {len(messages)} messages in the specified time range")
             else:
-                logger.info(f"No messages older than {args.days} days found in {args.folder}")
+                messages = cleaner.search_old_messages(args.days)
+                logger.info(f"Found {len(messages)} messages older than {args.days} days")
+            
+            # Delete found messages
+            if messages:
+                logger.info(f"Processing {len(messages)} emails in folder '{folder}'...")
+                deleted = cleaner.delete_messages(messages, dry_run=args.dry_run)
+                if args.dry_run:
+                    logger.info(f"Dry run: Would have deleted {deleted} messages from '{folder}'")
+                else:
+                    logger.info(f"Successfully deleted {deleted} messages from '{folder}'")
+                total_deleted += deleted
+            else:
+                if args.time_range:
+                    logger.info(f"No messages found in the specified time range in '{folder}'")
+                else:
+                    logger.info(f"No messages older than {args.days} days found in '{folder}'")
+        
+        # Log total results
+        if len(folders_to_process) > 1:
+            if args.dry_run:
+                logger.info(f"\nDry run summary: Would have deleted {total_deleted} messages from {len(folders_to_process)} folders")
+            else:
+                logger.info(f"\nTotal summary: Successfully deleted {total_deleted} messages from {len(folders_to_process)} folders")
     
     finally:
         # Always disconnect
         cleaner.disconnect()
+        logger.info("Operation complete")
 
 
 if __name__ == "__main__":
